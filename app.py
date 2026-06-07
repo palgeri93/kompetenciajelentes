@@ -112,7 +112,9 @@ def categorize_change(value: float) -> tuple[str, str]:
 def short_change_category(row: pd.Series) -> str:
     p1 = pd.to_numeric(row.get("Képességpont_1"), errors="coerce")
     p2 = pd.to_numeric(row.get("Képességpont_2"), errors="coerce")
-    if pd.isna(p1) and pd.isna(p2):
+    # Bemeneti mérésnél gyakran csak az aktuális/előzetes eredmény van meg.
+    # Ilyenkor nem szabad 0 pontos változásként, „elhanyagolhatóként” besorolni.
+    if pd.isna(p1) or pd.isna(p2):
         return "Nincs mindkét eredmény"
     value = float(row.get("Képességpont változás", 0) or 0)
     if value <= -100:
@@ -498,7 +500,9 @@ def add_level_chart(pdf: PdfPages, df: pd.DataFrame, alapszint: int, osztaly: st
     ax.bar(x - width / 2, df["Szint_1"], width, label="2024/2025")
     ax.bar(x + width / 2, df["Szint_2"], width, label="2025/2026 előzetes")
 
-    max_data_level = int(max(df["Szint_1"].max(), df["Szint_2"].max(), alapszint, 6 if angol else 7))
+    safe_levels = pd.concat([pd.to_numeric(df["Szint_1"], errors="coerce"), pd.to_numeric(df["Szint_2"], errors="coerce")]).dropna()
+    max_measured_level = float(safe_levels.max()) if not safe_levels.empty else 0
+    max_data_level = int(max(max_measured_level, float(alapszint or 0), 6 if angol else 7))
     ax.set_ylim(0, max_data_level + 0.8)
     if alapszint > 0:
         ax.axhline(alapszint, color="red", linestyle="--", linewidth=2, label=f"Alapszint: {alapszint}", zorder=3)
@@ -645,7 +649,9 @@ def make_level_chart_fig(df: pd.DataFrame, alapszint: int, osztaly: str, terulet
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.bar(x - width / 2, df["Szint_1"], width, label="2024/2025")
     ax.bar(x + width / 2, df["Szint_2"], width, label="2025/2026 előzetes")
-    max_data_level = int(max(df["Szint_1"].max(), df["Szint_2"].max(), alapszint, 6 if angol else 7))
+    safe_levels = pd.concat([pd.to_numeric(df["Szint_1"], errors="coerce"), pd.to_numeric(df["Szint_2"], errors="coerce")]).dropna()
+    max_measured_level = float(safe_levels.max()) if not safe_levels.empty else 0
+    max_data_level = int(max(max_measured_level, float(alapszint or 0), 6 if angol else 7))
     ax.set_ylim(0, max_data_level + 0.8)
     if alapszint > 0:
         ax.axhline(alapszint, color="red", linestyle="--", linewidth=2, label=f"Alapszint: {alapszint}", zorder=3)
@@ -720,16 +726,36 @@ def report_metrics(df: pd.DataFrame) -> dict[str, Any]:
     p2 = pd.to_numeric(df["Képességpont_2"], errors="coerce")
     s1 = pd.to_numeric(df["Szint_1"], errors="coerce")
     s2 = pd.to_numeric(df["Szint_2"], errors="coerce")
+
+    # Az átlagokat tanévenként külön számoljuk, hogy bemeneti mérésnél
+    # (amikor nincs előző tanévi eredmény) az aktuális átlag akkor is megjelenjen.
+    avg_p1 = float(p1.dropna().mean()) if p1.notna().any() else np.nan
+    avg_p2 = float(p2.dropna().mean()) if p2.notna().any() else np.nan
+    avg_s1 = float(s1.dropna().mean()) if s1.notna().any() else np.nan
+    avg_s2 = float(s2.dropna().mean()) if s2.notna().any() else np.nan
+
+    # A változást csak azoknál értelmezzük, akiknek mindkét tanévből van eredménye.
     both_points = p1.notna() & p2.notna()
-    avg_p1 = float(p1[both_points].mean()) if both_points.any() else 0.0
-    avg_p2 = float(p2[both_points].mean()) if both_points.any() else 0.0
-    point_diff = avg_p2 - avg_p1
-    point_pct = (point_diff / avg_p1 * 100) if avg_p1 else 0.0
+    if both_points.any():
+        avg_p1_common = float(p1[both_points].mean())
+        avg_p2_common = float(p2[both_points].mean())
+        point_diff = avg_p2_common - avg_p1_common
+        point_pct = (point_diff / avg_p1_common * 100) if avg_p1_common else np.nan
+    else:
+        point_diff = np.nan
+        point_pct = np.nan
+
     both_levels = s1.notna() & s2.notna()
-    avg_s1 = float(s1[both_levels].mean()) if both_levels.any() else 0.0
-    avg_s2 = float(s2[both_levels].mean()) if both_levels.any() else 0.0
-    level_diff = avg_s2 - avg_s1
-    level_pct = (level_diff / avg_s1 * 100) if avg_s1 else 0.0
+    if both_levels.any():
+        avg_s1_common = float(s1[both_levels].mean())
+        avg_s2_common = float(s2[both_levels].mean())
+        level_diff = avg_s2_common - avg_s1_common
+        level_pct = (level_diff / avg_s1_common * 100) if avg_s1_common else np.nan
+    else:
+        level_diff = np.nan
+        level_pct = np.nan
+
+    change_values = pd.to_numeric(df.loc[both_points, "Képességpont változás"], errors="coerce")
     counts = df["Változás kategória"].value_counts().reindex(CHANGE_ORDER, fill_value=0).astype(int)
     return {
         "avg_p1": avg_p1,
@@ -740,12 +766,50 @@ def report_metrics(df: pd.DataFrame) -> dict[str, Any]:
         "avg_s2": avg_s2,
         "level_diff": level_diff,
         "level_pct": level_pct,
+        "has_previous_points": bool(p1.notna().any()),
+        "has_current_points": bool(p2.notna().any()),
+        "has_comparable_points": bool(both_points.any()),
+        "has_previous_levels": bool(s1.notna().any()),
+        "has_current_levels": bool(s2.notna().any()),
+        "has_comparable_levels": bool(both_levels.any()),
         "counts": counts,
-        "negative": int((pd.to_numeric(df["Képességpont változás"], errors="coerce") < 0).sum()),
-        "positive": int((pd.to_numeric(df["Képességpont változás"], errors="coerce") > 0).sum()),
+        "negative": int((change_values < 0).sum()),
+        "positive": int((change_values > 0).sum()),
         "moderate_or_significant_positive": int(counts.get("Mérsékelt +", 0) + counts.get("Jelentős +", 0)),
     }
 
+
+
+
+def average_summary_table(df: pd.DataFrame, previous_year: str, current_year: str) -> pd.DataFrame:
+    metrics = report_metrics(df)
+    rows = [
+        {
+            "Mutató": f"Átlag képességpont ({previous_year})",
+            "Érték": fmt_num(metrics["avg_p1"], 2),
+        },
+        {
+            "Mutató": f"Átlag képességpont ({current_year} előzetes)",
+            "Érték": fmt_num(metrics["avg_p2"], 2),
+        },
+        {
+            "Mutató": "Összehasonlítható tanulók alapján mért pontváltozás",
+            "Érték": fmt_num(metrics["point_diff"], 2),
+        },
+        {
+            "Mutató": "Összehasonlítható tanulók alapján mért százalékos változás",
+            "Érték": fmt_pct(metrics["point_pct"], 2),
+        },
+        {
+            "Mutató": f"Átlag képességszint ({previous_year})",
+            "Érték": fmt_num(metrics["avg_s1"], 2),
+        },
+        {
+            "Mutató": f"Átlag képességszint ({current_year} előzetes)",
+            "Érték": fmt_num(metrics["avg_s2"], 2),
+        },
+    ]
+    return pd.DataFrame(rows)
 
 def level_sentence(df: pd.DataFrame, col: str, max_level: int, year_label: str) -> str:
     dist = level_distribution(df, col, max_level)
@@ -1018,13 +1082,26 @@ preview_cols = [c for c in ["Évfolyam", "Tanulócsoportok", "Mérési azonosít
 st.dataframe(df[preview_cols], use_container_width=True)
 st.caption(f"{len(df)} tanuló • terület: {terulet} • osztály/tanulócsoport: {selected_class}")
 
+metrics = report_metrics(df)
+st.subheader("Átlagok")
+metric_cols = st.columns(4)
+metric_cols[0].metric(f"Átlag pont ({previous_year})", fmt_num(metrics["avg_p1"], 2))
+metric_cols[1].metric(f"Átlag pont ({current_year} előzetes)", fmt_num(metrics["avg_p2"], 2))
+metric_cols[2].metric("Pontváltozás", fmt_num(metrics["point_diff"], 2))
+metric_cols[3].metric("Százalékos változás", fmt_pct(metrics["point_pct"], 2))
+st.dataframe(average_summary_table(df, previous_year, current_year), use_container_width=True, hide_index=True)
+if not metrics["has_comparable_points"]:
+    st.info("Ennél a csoportnál nincs összehasonlítható előző tanévi és aktuális képességpont-pár. Az aktuális átlag ettől még megjelenik, a változás mezők ezért '-' értékűek.")
+
 col1, col2 = st.columns(2)
 with col1:
     st.subheader("Változás mértéke összesítő")
     st.dataframe(change_summary(df, selected_class), use_container_width=True, hide_index=True)
 with col2:
     st.subheader("Szintmegoszlás")
-    max_level_preview = int(max(6 if angol else 7, df["Szint_1"].max(), df["Szint_2"].max()))
+    preview_safe_levels = pd.concat([pd.to_numeric(df["Szint_1"], errors="coerce"), pd.to_numeric(df["Szint_2"], errors="coerce")]).dropna()
+    preview_max_measured = float(preview_safe_levels.max()) if not preview_safe_levels.empty else 0
+    max_level_preview = int(max(6 if angol else 7, preview_max_measured))
     level_rows = []
     for label, col in [("2024/2025", "Szint_1"), ("2025/2026 előzetes", "Szint_2")]:
         dist = level_distribution(df, col, max_level_preview)
